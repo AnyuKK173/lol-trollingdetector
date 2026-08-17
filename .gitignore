@@ -1,0 +1,15 @@
+.env
+.pytest_cache/
+__pycache__/
+*.py[cod]
+raw_samples/
+parquet/
+baselines/
+.venv/
+output_v3/
+output_v4/
+models/
+*.joblib
+*.parquet
+*.zip
+.coverage

@@ -1,0 +1,10 @@
+requests>=2.32,<3
+python-dotenv>=1.0,<2
+psycopg2-binary>=2.9,<3
+pandas>=2.2,<3
+numpy>=1.26,<3
+SQLAlchemy>=2.0,<3
+pyarrow>=16,<24
+scikit-learn>=1.4,<2
+joblib>=1.4,<2
+pytest>=8,<10
