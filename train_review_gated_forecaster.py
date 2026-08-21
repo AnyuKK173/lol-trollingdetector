@@ -20,14 +20,10 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, brier_score_loss, log_loss, roc_auc_score
 from sklearn.model_selection import GroupKFold
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OrdinalEncoder
 
 from build_timeline_teacher_dataset import sha256_of
 
@@ -57,29 +53,24 @@ def _match_bucket(value: str, modulus: int = 10) -> int:
     return int(hashlib.sha256(str(value).encode("utf-8")).hexdigest(), 16) % modulus
 
 
-def build_estimator(numeric: list[str], categorical: list[str]) -> Pipeline:
-    numeric_pipe = Pipeline([("impute", SimpleImputer(strategy="median", add_indicator=True))])
-    categorical_pipe = Pipeline(
-        [
-            ("impute", SimpleImputer(strategy="most_frequent")),
-            (
-                "ordinal",
-                OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=np.nan, encoded_missing_value=np.nan),
-            ),
-        ]
-    )
-    preprocess = ColumnTransformer(
-        [("numeric", numeric_pipe, numeric), ("categorical", categorical_pipe, categorical)],
-        remainder="drop",
-        verbose_feature_names_out=False,
-    )
-    categorical_mask = [False] * (len(numeric) * 2) + [True] * len(categorical)
-    # SimpleImputer only adds indicators for columns that are missing during
-    # fit, so a fixed mask cannot safely account for them. Keep the estimator
-    # numeric; ordinal category IDs are merely stable codes, not an ordering
-    # claim, and the A/B/C comparison uses the same encoding throughout.
-    _ = categorical_mask
-    model = HistGradientBoostingClassifier(
+def prepare_features(frame: pd.DataFrame, numeric: list[str], categorical: list[str]) -> pd.DataFrame:
+    """Selects the model's columns and casts the nominal ones (role,
+    champion_id, baseline_scope, review_state_candidate, ...) to pandas'
+    category dtype, which is what HistGradientBoostingClassifier's
+    categorical_features="from_dtype" requires to split on them as sets of
+    values rather than an ordered numeric scale. Numeric columns keep their
+    native NaNs -- the model splits on "is missing" directly, which matters
+    here because missingness (e.g. no lane opponent, no current teacher
+    checkpoint) is itself informative and should not be imputed away."""
+    features = frame[numeric + categorical].copy()
+    for column in categorical:
+        features[column] = features[column].astype("category")
+    return features
+
+
+def build_estimator() -> HistGradientBoostingClassifier:
+    return HistGradientBoostingClassifier(
+        categorical_features="from_dtype",
         learning_rate=0.06,
         max_iter=300,
         max_leaf_nodes=31,
@@ -89,7 +80,6 @@ def build_estimator(numeric: list[str], categorical: list[str]) -> Pipeline:
         early_stopping=True,
         random_state=42,
     )
-    return Pipeline([("preprocess", preprocess), ("model", model)])
 
 
 def should_train(train_y: pd.Series, test_y: pd.Series) -> tuple[bool, str | None]:
@@ -141,9 +131,9 @@ def grouped_cv(frame: pd.DataFrame, label: str, numeric: list[str], categorical:
         train_fold, valid_fold = frame.iloc[train_index], frame.iloc[valid_index]
         if train_fold[label].nunique() < 2 or valid_fold[label].nunique() < 2:
             continue
-        estimator = build_estimator(numeric, categorical)
-        estimator.fit(train_fold[numeric + categorical], train_fold[label].astype(bool))
-        probability = estimator.predict_proba(valid_fold[numeric + categorical])[:, 1]
+        estimator = build_estimator()
+        estimator.fit(prepare_features(train_fold, numeric, categorical), train_fold[label].astype(bool))
+        probability = estimator.predict_proba(prepare_features(valid_fold, numeric, categorical))[:, 1]
         fold_metrics.append(
             {
                 "roc_auc": float(roc_auc_score(valid_fold[label], probability)),
@@ -168,17 +158,17 @@ def fit_calibrated(
     fit, calibration = train.loc[~calibration_mask], train.loc[calibration_mask]
     if fit[label].nunique() < 2 or calibration[label].nunique() < 2:
         raise ValueError("whole-match fit/calibration split lacks both classes")
-    estimator = build_estimator(numeric, categorical)
-    columns = numeric + categorical
-    estimator.fit(fit[columns], fit[label].astype(bool))
-    raw = np.clip(estimator.predict_proba(calibration[columns])[:, 1], 1e-6, 1 - 1e-6)
+    estimator = build_estimator()
+    estimator.fit(prepare_features(fit, numeric, categorical), fit[label].astype(bool))
+    raw = np.clip(estimator.predict_proba(prepare_features(calibration, numeric, categorical))[:, 1], 1e-6, 1 - 1e-6)
     calibrator = LogisticRegression(C=1.0, solver="lbfgs", random_state=42)
     calibrator.fit(np.log(raw / (1 - raw)).reshape(-1, 1), calibration[label].astype(bool))
-    return {"estimator": estimator, "calibrator": calibrator, "features": columns, "label": label}
+    return {"estimator": estimator, "calibrator": calibrator, "numeric": numeric, "categorical": categorical, "label": label}
 
 
 def predict_bundle(bundle: dict[str, Any], frame: pd.DataFrame) -> np.ndarray:
-    raw = np.clip(bundle["estimator"].predict_proba(frame[bundle["features"]])[:, 1], 1e-6, 1 - 1e-6)
+    features = prepare_features(frame, bundle["numeric"], bundle["categorical"])
+    raw = np.clip(bundle["estimator"].predict_proba(features)[:, 1], 1e-6, 1 - 1e-6)
     return bundle["calibrator"].predict_proba(np.log(raw / (1 - raw)).reshape(-1, 1))[:, 1]
 
 

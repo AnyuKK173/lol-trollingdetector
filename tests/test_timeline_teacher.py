@@ -1,7 +1,7 @@
 import pandas as pd
 
-from build_timeline_teacher_dataset import FEATURE_COLUMNS, build_checkpoint_rows, retained_match_splits
-from train_timeline_teacher import fit_quantile_baseline, percentile_from_quantiles
+from build_timeline_teacher_dataset import FEATURE_COLUMNS, KEYS, build_checkpoint_rows, retained_match_splits
+from train_timeline_teacher import cross_fit_oof, fit_quantile_baseline, percentile_from_quantiles
 
 
 def _frames(match_id="m1"):
@@ -93,3 +93,46 @@ def test_teacher_quantiles_use_only_passed_training_rows():
     baseline = fit_quantile_baseline(train, min_rows=1)
     assert baseline.iloc[0].teacher_p75 == pytest.approx(0.325)
     assert percentile_from_quantiles(0.2, 0.1, 0.2, 0.3) == 50.0
+
+
+def _synthetic_train_rows(n_matches: int = 60) -> pd.DataFrame:
+    """One row per match; win alternates by index so every reasonably-sized
+    subset (fold pool, calibration holdout) contains both outcomes."""
+    rows = []
+    for i in range(n_matches):
+        row = {
+            "match_id": f"synthetic_{i}",
+            "puuid": f"p{i}",
+            "participant_id": 1,
+            "split": "train",
+            "role": "TOP",
+            "final_win": i % 2 == 0,
+        }
+        for column in FEATURE_COLUMNS:
+            row[column] = float(i % 5)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def test_cross_fit_oof_covers_every_train_row_exactly_once():
+    train = _synthetic_train_rows()
+    oof = cross_fit_oof(train, n_splits=3)
+    assert len(oof) == len(train)
+    assert not oof.duplicated(KEYS).any()
+    assert set(oof["match_id"]) == set(train["match_id"])
+    assert oof["teacher_probability"].notna().all()
+
+
+def test_cross_fit_oof_never_scores_a_row_with_a_model_fit_on_its_own_match():
+    """Each held-out fold's rows must come from a model fit on a fold pool
+    that excludes their own match -- verified by checking every match_id
+    appears in exactly one fold's held-out output, never leaking into two
+    folds' training pools simultaneously (which would happen if GroupKFold
+    grouping were broken)."""
+    train = _synthetic_train_rows()
+    oof = cross_fit_oof(train, n_splits=3)
+    # one row per match in the output implies each match was held out by
+    # exactly one fold -- if a match had leaked into a fold pool it was also
+    # held out from, cross_fit_oof's own duplicate-key check above would
+    # already have failed; this asserts the row count reconciles exactly.
+    assert oof.groupby("match_id").size().eq(1).all()

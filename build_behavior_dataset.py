@@ -318,6 +318,7 @@ def sha256_of(path: Path) -> str:
 
 
 def main() -> int:
+    sys.stdout.reconfigure(encoding="utf-8")
     load_dotenv(ROOT / ".env")
     database_url = os.getenv("DATABASE_URL", "").strip()
     target_patch = os.getenv("TARGET_PATCH", "").strip()
@@ -703,10 +704,16 @@ def main() -> int:
         "mixed_split_matches_excluded": len(mixed_match_ids),
         "mixed_split_excluded_subject_rows": excluded_subject_rows,
         "split_strategy": "deterministic md5(puuid) hash bucketing, 80/20 train/test; matches with subjects on both sides are dropped entirely (see mixed_split_matches_excluded)",
+        "dataset_file": str(dataset_path.relative_to(ROOT)).replace("\\", "/"),
+        "dataset_file_sha256": sha256_of(dataset_path),
         "baseline_file": str(baseline_path.relative_to(ROOT)).replace("\\", "/"),
         "baseline_file_sha256": sha256_of(baseline_path),
         "rate_baseline_file": str(rate_baseline_path.relative_to(ROOT)).replace("\\", "/"),
         "rate_baseline_file_sha256": sha256_of(rate_baseline_path),
+        "source_files_sha256": {
+            name: sha256_of(ROOT / name)
+            for name in ("build_behavior_dataset.py", "build_baselines.py", "p_score.py", "parsers.py")
+        },
         "baseline_fit_scope": "TRAIN split only, computed in this same run and saved to the two files above — baseline_match_n/player_n in the dataset are guaranteed to match those files exactly (verify via the SHA-256)",
         "baseline_thresholds": {"min_champion_samples": 40, "min_role_samples": 400, "min_global_samples": 800},
         "baseline_scope_by_role_pct": {
