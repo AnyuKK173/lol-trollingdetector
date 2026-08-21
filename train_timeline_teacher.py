@@ -20,11 +20,13 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, brier_score_loss, log_loss, roc_auc_score
+from sklearn.model_selection import GroupKFold
 
 from build_timeline_teacher_dataset import FEATURE_COLUMNS, KEYS, ROLES, sha256_of
 
 MIN_ROLE_TRAIN_ROWS = 500
 MIN_MINUTE_BASELINE_ROWS = 100
+OOF_FOLDS = 5
 
 
 def match_bucket(match_id: str, modulus: int = 10) -> int:
@@ -96,13 +98,8 @@ def safe_metrics(y_true: pd.Series, probability: np.ndarray) -> dict[str, Any]:
     return result
 
 
-def train_role(role_frame: pd.DataFrame) -> tuple[dict[str, Any], pd.DataFrame, dict[str, Any]]:
-    train = role_frame[role_frame["split"] == "train"].copy()
-    test = role_frame[role_frame["split"] == "test"].copy()
-    if len(train) < MIN_ROLE_TRAIN_ROWS or train["final_win"].nunique() < 2:
-        raise ValueError(f"insufficient training data: n={len(train)} outcomes={train['final_win'].nunique()}")
-    fit, calibration = split_fit_calibration(train)
-    model = HistGradientBoostingClassifier(
+def build_teacher_model() -> HistGradientBoostingClassifier:
+    return HistGradientBoostingClassifier(
         learning_rate=0.06,
         max_iter=300,
         max_leaf_nodes=31,
@@ -112,28 +109,107 @@ def train_role(role_frame: pd.DataFrame) -> tuple[dict[str, Any], pd.DataFrame, 
         early_stopping=True,
         random_state=42,
     )
-    model.fit(fit[FEATURE_COLUMNS], fit["final_win"].astype(bool))
-    calibration_raw = np.clip(model.predict_proba(calibration[FEATURE_COLUMNS])[:, 1], 1e-6, 1 - 1e-6)
-    calibrator = LogisticRegression(C=1.0, solver="lbfgs", random_state=42)
-    calibrator.fit(np.log(calibration_raw / (1 - calibration_raw)).reshape(-1, 1), calibration["final_win"].astype(bool))
 
-    scored_parts = []
-    metrics: dict[str, Any] = {}
-    for split_name, part in (("train", train), ("test", test)):
-        if part.empty:
-            metrics[split_name] = {"n": 0}
+
+def _fit_calibrator(model: HistGradientBoostingClassifier, calibration: pd.DataFrame) -> LogisticRegression:
+    raw = np.clip(model.predict_proba(calibration[FEATURE_COLUMNS])[:, 1], 1e-6, 1 - 1e-6)
+    calibrator = LogisticRegression(C=1.0, solver="lbfgs", random_state=42)
+    calibrator.fit(np.log(raw / (1 - raw)).reshape(-1, 1), calibration["final_win"].astype(bool))
+    return calibrator
+
+
+def _score(
+    model: HistGradientBoostingClassifier, calibrator: LogisticRegression, frame: pd.DataFrame
+) -> tuple[np.ndarray, np.ndarray]:
+    raw = np.clip(model.predict_proba(frame[FEATURE_COLUMNS])[:, 1], 1e-6, 1 - 1e-6)
+    calibrated = calibrator.predict_proba(np.log(raw / (1 - raw)).reshape(-1, 1))[:, 1]
+    return raw, calibrated
+
+
+def cross_fit_oof(train: pd.DataFrame, n_splits: int = OOF_FOLDS) -> pd.DataFrame:
+    """Match-grouped K-fold cross-fitting for the train split.
+
+    Without this, every train row's teacher_probability came from a model
+    (and calibrator) that was fit on a subset overlapping that row's own
+    match-adjacent training data, while every test row's score came from a
+    model that never saw the test match at all. Downstream consumers
+    (the teacher's own P25/P50/P75 baseline, and the B/C forecasters that
+    take teacher_probability as an input feature) received a systematically
+    different score distribution for train vs. test -- a train/test mismatch
+    baked into the features themselves, independent of and in addition to
+    any direct future-data leakage.
+
+    Here, for each fold, a fresh model+calibrator is fit on the other
+    (n_splits - 1) folds' matches and used only to score the held-out fold,
+    so every train row's score comes from a model that never saw its match.
+    """
+    groups = train["match_id"]
+    n_splits = min(n_splits, groups.nunique())
+    if n_splits < 2:
+        raise ValueError("need at least two match groups for cross-fitting")
+    parts = []
+    for fold_index, holdout_index in GroupKFold(n_splits=n_splits).split(train, train["final_win"], groups):
+        fold_pool, holdout = train.iloc[fold_index], train.iloc[holdout_index]
+        if fold_pool.empty or holdout.empty or fold_pool["final_win"].nunique() < 2:
             continue
-        raw = np.clip(model.predict_proba(part[FEATURE_COLUMNS])[:, 1], 1e-6, 1 - 1e-6)
-        calibrated = calibrator.predict_proba(np.log(raw / (1 - raw)).reshape(-1, 1))[:, 1]
-        scored = part[KEYS + ["puuid", "split", "role"]].copy()
-        scored["teacher_raw_probability"] = raw
-        scored["teacher_probability"] = calibrated
-        scored_parts.append(scored)
-        metrics[split_name] = safe_metrics(part["final_win"].astype(bool), calibrated)
+        try:
+            fit, calibration = split_fit_calibration(fold_pool)
+        except ValueError:
+            continue
+        model = build_teacher_model()
+        model.fit(fit[FEATURE_COLUMNS], fit["final_win"].astype(bool))
+        calibrator = _fit_calibrator(model, calibration)
+        raw, calibrated = _score(model, calibrator, holdout)
+        part = holdout[KEYS + ["puuid", "split", "role", "final_win"]].copy()
+        part["teacher_raw_probability"] = raw
+        part["teacher_probability"] = calibrated
+        parts.append(part)
+    if not parts:
+        raise ValueError("cross-fitting produced no out-of-fold rows")
+    oof = pd.concat(parts, ignore_index=True)
+    missing_n = len(train) - len(oof)
+    if missing_n:
+        raise AssertionError(f"{missing_n} train rows did not receive an out-of-fold prediction")
+    return oof
+
+
+def train_role(role_frame: pd.DataFrame, oof_folds: int = OOF_FOLDS) -> tuple[dict[str, Any], pd.DataFrame, dict[str, Any]]:
+    train = role_frame[role_frame["split"] == "train"].copy()
+    test = role_frame[role_frame["split"] == "test"].copy()
+    if len(train) < MIN_ROLE_TRAIN_ROWS or train["final_win"].nunique() < 2:
+        raise ValueError(f"insufficient training data: n={len(train)} outcomes={train['final_win'].nunique()}")
+
+    # Out-of-fold scores for every train row -- used for the teacher's own
+    # baseline and as the B/C forecasters' teacher features. Never a
+    # prediction from a model fit on that row's own match.
+    oof_train = cross_fit_oof(train, oof_folds)
+
+    # Production model: fit on the FULL train set (same fit/calibration
+    # split as before), used only to score the held-out test split.
+    fit, calibration = split_fit_calibration(train)
+    model = build_teacher_model()
+    model.fit(fit[FEATURE_COLUMNS], fit["final_win"].astype(bool))
+    calibrator = _fit_calibrator(model, calibration)
+
+    scored_parts = [oof_train.drop(columns="final_win")]
+    metrics: dict[str, Any] = {
+        "train": safe_metrics(oof_train["final_win"].astype(bool), oof_train["teacher_probability"].to_numpy())
+    }
+    if test.empty:
+        metrics["test"] = {"n": 0}
+    else:
+        raw, calibrated = _score(model, calibrator, test)
+        test_scored = test[KEYS + ["puuid", "split", "role"]].copy()
+        test_scored["teacher_raw_probability"] = raw
+        test_scored["teacher_probability"] = calibrated
+        scored_parts.append(test_scored)
+        metrics["test"] = safe_metrics(test["final_win"].astype(bool), calibrated)
+
     bundle = {
         "model": model,
         "calibrator": calibrator,
         "features": FEATURE_COLUMNS,
+        "oof_folds": oof_folds,
         "semantic": "checkpoint outcome proxy; not skill, intent, or trolling truth",
     }
     return bundle, pd.concat(scored_parts, ignore_index=True), metrics
@@ -144,6 +220,7 @@ def main() -> int:
     parser.add_argument("--checkpoints", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--min-minute-baseline-rows", type=int, default=MIN_MINUTE_BASELINE_ROWS)
+    parser.add_argument("--oof-folds", type=int, default=OOF_FOLDS)
     args = parser.parse_args()
 
     data = pd.read_parquet(args.checkpoints)
@@ -164,7 +241,7 @@ def main() -> int:
             role_manifest[role] = {"trained": False, "reason": "no rows"}
             continue
         try:
-            bundle, scored, metrics = train_role(role_frame)
+            bundle, scored, metrics = train_role(role_frame, args.oof_folds)
         except ValueError as exc:
             role_manifest[role] = {"trained": False, "reason": str(exc)}
             continue
@@ -203,7 +280,13 @@ def main() -> int:
         "target": "final_win",
         "target_excluded_from_features": "final_win" not in FEATURE_COLUMNS,
         "calibration": "Platt/logistic calibration on whole-match holdout from the train split",
-        "baseline_fit_scope": "train split only; role x cutoff minute",
+        "train_scoring": (
+            f"match-grouped {args.oof_folds}-fold cross-fitting: every train row's teacher_probability "
+            "comes from a model+calibrator fit on other folds' matches only, never on its own match"
+        ),
+        "test_scoring": "final production model+calibrator, fit on the full train split, used only to score test",
+        "oof_folds": args.oof_folds,
+        "baseline_fit_scope": "train split only (out-of-fold scores); role x cutoff minute",
         "min_minute_baseline_rows": args.min_minute_baseline_rows,
         "roles": role_manifest,
         "checkpoints_file": checkpoints_path.name,

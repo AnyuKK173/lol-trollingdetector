@@ -175,6 +175,7 @@ def compute_baselines(
 
 
 def main() -> int:
+    sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(
         description="从已采集 Gold 玩家帧构建 P25/P50/P75 经验表现曲线。"
     )

@@ -17,6 +17,7 @@ def scalar(cursor, sql: str) -> int:
 
 
 def main() -> int:
+    sys.stdout.reconfigure(encoding="utf-8")
     load_dotenv(ROOT / ".env")
     database_url = os.getenv("DATABASE_URL", "").strip()
     if not database_url:
